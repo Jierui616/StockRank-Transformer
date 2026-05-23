@@ -162,6 +162,7 @@ def main():
 	top5_stocks = ranked_stock_ids[:5]
 	top5_scores = scores[order][:5]
 	top5_weights = softmax(top5_scores)
+	top5_weights[-1] = 1.0 - top5_weights[:-1].sum()  # 强制和精确为1.0
 	output_df = pd.DataFrame({
 		'stock_id': top5_stocks,
 		'weight': top5_weights,

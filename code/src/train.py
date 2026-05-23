@@ -40,21 +40,40 @@ feature_engineer_func_map = {
 
 
 def _build_label_and_clean(processed, drop_small_open=True):
-    """统一构建标签并清洗无效样本。使用多horizon rank组合标签。"""
+    """统一构建标签并清洗无效样本。支持市值中性化。"""
     processed = processed.copy()
     processed['open_t1'] = processed.groupby('股票代码')['开盘'].shift(-1)
     processed['open_t2'] = processed.groupby('股票代码')['开盘'].shift(-2)
     processed['open_t5'] = processed.groupby('股票代码')['开盘'].shift(-5)
 
-    # 过滤无效开盘价，避免收益率极端爆炸
+    # 过滤无效开盘价
     if drop_small_open:
         processed = processed[processed['open_t1'] > 1e-4]
 
-    # 计算各horizon收益率
+    # 计算各horizon原始收益率
     processed['ret_1d'] = (processed['open_t2'] - processed['open_t1']) / (processed['open_t1'] + 1e-12)
     processed['ret_5d'] = (processed['open_t5'] - processed['open_t1']) / (processed['open_t1'] + 1e-12)
 
-    # Cross-sectional rank归一化（同一天内排名），再加权组合
+    # ---- 市值中性化 ----
+    if config.get('use_label_neutralization', False):
+        # 流通市值代理: 成交额 / 换手率
+        processed['mkt_cap_proxy'] = processed['成交额'] / (processed['换手率'] + 1e-12)
+        processed['log_mkt'] = np.log(processed['mkt_cap_proxy'] + 1e-12)
+
+        def _neutralize_day(grp):
+            X = np.column_stack([np.ones(len(grp)), grp['log_mkt'].values])
+            for col in ['ret_1d', 'ret_5d']:
+                y = grp[col].values
+                if len(grp) > 10:
+                    beta = np.linalg.lstsq(X, y, rcond=None)[0]
+                    grp[col] = y - X @ beta
+            return grp
+
+        processed = processed.groupby('日期', group_keys=False).apply(_neutralize_day)
+        processed.drop(columns=['mkt_cap_proxy', 'log_mkt'], inplace=True)
+        print("标签市值中性化完成")
+
+    # Cross-sectional rank归一化后加权组合
     processed['ret_1d_rank'] = processed.groupby('日期')['ret_1d'].rank(pct=True)
     processed['ret_5d_rank'] = processed.groupby('日期')['ret_5d'].rank(pct=True)
 

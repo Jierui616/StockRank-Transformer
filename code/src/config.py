@@ -24,8 +24,12 @@ config = {
     # 多horizon标签权重 [1日, 5日]
     'label_horizon_weights': [0.3, 0.7],
 
+    # 标签市值中性化
+    'use_label_neutralization': False,  # 暂时关闭，需debug
+
     # LambdaRank 参数
-    'lambda_sigma': 1.0,     # 温度系数
+    'lambda_sigma': 0.5,     # 温度系数 (0.3~5.0, 金融数据推荐0.5)
+    'sigma_search': [0.3, 0.5, 1.0, 2.0, 5.0],  # 网格搜索候选值
 
     # 特征筛选
     'feature_selection_topk': 80,
