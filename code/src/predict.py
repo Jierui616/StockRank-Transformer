@@ -1,10 +1,12 @@
 import os
+import json
 import multiprocessing as mp
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
+from scipy.special import softmax
 from tqdm import tqdm
 
 from config import config
@@ -113,6 +115,14 @@ def main():
 	stockid2idx = {sid: idx for idx, sid in enumerate(stock_ids)}
 
 	processed, features = preprocess_predict_data(raw_df, stockid2idx)
+
+	# 读取训练时保存的特征筛选结果
+	selected_path = os.path.join(config['output_dir'], 'selected_features.json')
+	if os.path.exists(selected_path):
+		with open(selected_path, 'r') as f:
+			features = json.load(f)
+		print(f"使用筛选后特征: {len(features)} 个")
+
 	processed[features] = processed[features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 	scaler = joblib.load(scaler_path)
@@ -146,13 +156,15 @@ def main():
 	order = np.argsort(scores)[::-1]
 	ranked_stock_ids = [sequence_stock_ids[i] for i in order]
 
-	# 仅输出前5，权重固定 0.2
+	# Top5 按 softmax(scores) 分配权重
 	if len(ranked_stock_ids) < 5:
 		raise ValueError(f'可预测股票不足5只，当前仅有 {len(ranked_stock_ids)} 只')
-	top5 = ranked_stock_ids[:5]
+	top5_stocks = ranked_stock_ids[:5]
+	top5_scores = scores[order][:5]
+	top5_weights = softmax(top5_scores)
 	output_df = pd.DataFrame({
-		'stock_id': top5,
-		'weight': [0.2] * len(top5),
+		'stock_id': top5_stocks,
+		'weight': top5_weights,
 	})
 	output_df.to_csv(output_path, index=False)
 

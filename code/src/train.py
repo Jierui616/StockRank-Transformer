@@ -11,9 +11,11 @@ from config import config
 from model import StockTransformer
 from utils import engineer_features_39, engineer_features_158plus39
 from utils import create_ranking_dataset_vectorized
+from utils import select_features_lgb
 import joblib
 import os
 import json
+import math
 import multiprocessing as mp
 import random
 def set_seed(seed=42):
@@ -38,18 +40,31 @@ feature_engineer_func_map = {
 
 
 def _build_label_and_clean(processed, drop_small_open=True):
-    """统一构建标签并清洗无效样本。"""
+    """统一构建标签并清洗无效样本。使用多horizon rank组合标签。"""
+    processed = processed.copy()
     processed['open_t1'] = processed.groupby('股票代码')['开盘'].shift(-1)
+    processed['open_t2'] = processed.groupby('股票代码')['开盘'].shift(-2)
     processed['open_t5'] = processed.groupby('股票代码')['开盘'].shift(-5)
 
     # 过滤无效开盘价，避免收益率极端爆炸
     if drop_small_open:
         processed = processed[processed['open_t1'] > 1e-4]
 
-    processed['label'] = (processed['open_t5'] - processed['open_t1']) / (processed['open_t1'] + 1e-12)
+    # 计算各horizon收益率
+    processed['ret_1d'] = (processed['open_t2'] - processed['open_t1']) / (processed['open_t1'] + 1e-12)
+    processed['ret_5d'] = (processed['open_t5'] - processed['open_t1']) / (processed['open_t1'] + 1e-12)
+
+    # Cross-sectional rank归一化（同一天内排名），再加权组合
+    processed['ret_1d_rank'] = processed.groupby('日期')['ret_1d'].rank(pct=True)
+    processed['ret_5d_rank'] = processed.groupby('日期')['ret_5d'].rank(pct=True)
+
+    w1, w5 = config['label_horizon_weights']
+    processed['label'] = w1 * processed['ret_1d_rank'] + w5 * processed['ret_5d_rank']
+
     processed = processed.dropna(subset=['label'])
 
-    processed.drop(columns=['open_t1', 'open_t5'], inplace=True)
+    processed.drop(columns=['open_t1', 'open_t2', 'open_t5',
+                            'ret_1d', 'ret_5d', 'ret_1d_rank', 'ret_5d_rank'], inplace=True)
     return processed
 
 
@@ -95,80 +110,63 @@ def preprocess_val_data(df, stockid2idx=None):
     return _preprocess_common(df, stockid2idx, desc="验证集特征工程", drop_small_open=True)
 
 
-# 加权的排序损失函数
-class WeightedRankingLoss(nn.Module):
+# LambdaRank 排序损失函数
+class LambdaRankLoss(nn.Module):
     """
-    组合的加权排序损失函数，着重强调top-k的样本。
+    LambdaRank 损失：用 ΔNDCG 对 pairwise loss 加权，直接优化排序指标。
+    loss = Σ ΔNDCG_ij × log(1 + exp(-σ × sign(rel_i-rel_j) × (s_i - s_j)))
     """
-    def __init__(self, temperature=1.0, k=5, weight_factor=2.0, pairwise_weight=1, base_weight=1.0):
-        super(WeightedRankingLoss, self).__init__()
-        self.temperature = temperature
+    def __init__(self, sigma=1.0, k=5):
+        super(LambdaRankLoss, self).__init__()
+        self.sigma = sigma
         self.k = k
-        self.weight_factor = weight_factor
-        self.pairwise_weight = pairwise_weight
-        self.base_weight = base_weight
 
-    def listwise_loss(self, y_pred, y_true, weights):
-        """加权的Listwise损失 (KL散度 + Cross Entropy)"""
-        
-        pred_probs = F.softmax(y_pred / self.temperature, dim=1)
-        target_probs = F.softmax(y_true / self.temperature, dim=1)
-
-        # 加权 Cross Entropy（原实现未使用 weights）
-        weighted_ce = -(target_probs * torch.log(pred_probs + 1e-12) * weights)
-        ce_loss = (weighted_ce.sum(dim=1) / (weights.sum(dim=1) + 1e-12)).mean()
-        
-        return ce_loss
-
-    def pairwise_loss(self, y_pred, y_true, weights):
-        """加权的Pairwise损失"""
-        batch_size, num_items = y_pred.size()
-        
-        pred_diff = y_pred.unsqueeze(2) - y_pred.unsqueeze(1)
-        true_diff = y_true.unsqueeze(2) - y_true.unsqueeze(1)
-        
-        # 只考虑真实标签不同的项目对
-        mask = (true_diff != 0).float()
-        
-        # 创建权重矩阵
-        # 如果一对(i, j)中，i或j是关键样本，则权重更高
-        weight_matrix = weights.unsqueeze(2) + weights.unsqueeze(1)
-        # weight_matrix = torch.where(weight_matrix > 2.0, self.weight_factor, 1.0)
-        
-        pairwise_loss = torch.sigmoid(-pred_diff * torch.sign(true_diff))
-        
-        # 应用mask和权重
-        weighted_loss = pairwise_loss * mask * weight_matrix
-        
-        num_pairs = mask.sum(dim=[1, 2]).clamp(min=1)
-        loss = (weighted_loss.sum(dim=[1, 2]) / num_pairs).mean()
-        
-        return loss
-        
     def forward(self, y_pred, y_true):
-        """
-        y_pred: [batch, num_items]
-        y_true: [batch, num_items] (真实涨跌幅)
-        """
-        batch_size, num_items = y_true.size()
-        k = min(self.k, num_items)
+        batch_size, num_items = y_pred.size()
+        if num_items < 2:
+            return torch.tensor(0.0, device=y_pred.device, requires_grad=True)
 
-        # 1. 识别 top-k 的样本
-        _, top_indices = torch.topk(y_true, k, dim=1)
-        
-        # 2. 创建权重向量
-        weights = torch.full_like(y_true, fill_value=self.base_weight)
-        for i in range(batch_size):
-            weights[i, top_indices[i]] = self.weight_factor
-            
-        # 3. 计算加权损失
-        listwise = self.listwise_loss(y_pred, y_true, weights)
-        pairwise = self.pairwise_loss(y_pred, y_true, weights)
-        
-        # 组合两种损失
-        total_loss = listwise + self.pairwise_weight * pairwise
-        
-        return total_loss
+        total_loss = torch.tensor(0.0, device=y_pred.device)
+
+        for b in range(batch_size):
+            pred = y_pred[b]
+            true = y_true[b]
+
+            # Normalize relevance to [0, 1] for gain computation
+            rel_min, rel_max = true.min(), true.max()
+            if rel_max > rel_min:
+                rel_norm = (true - rel_min) / (rel_max - rel_min + 1e-12)
+            else:
+                rel_norm = torch.zeros_like(true)
+
+            gains = torch.pow(2.0, rel_norm) - 1.0
+
+            # Model-ordered positions (LambdaRank 关键: 用当前模型排序)
+            positions = torch.argsort(torch.argsort(pred, descending=True)).float()
+
+            # Discount: 1 / log2(pos + 2) (pos 0-indexed)
+            discounts = 1.0 / torch.log2(positions + 2.0)
+
+            # Pairwise matrices [N, N]
+            pred_diff = pred.unsqueeze(1) - pred.unsqueeze(0)
+            true_diff = true.unsqueeze(1) - true.unsqueeze(0)
+            pair_mask = (true_diff.abs() > 1e-8).float()
+
+            # ΔNDCG = |gain_diff| × |discount_diff|
+            gain_diff = gains.unsqueeze(1) - gains.unsqueeze(0)    # [N, N]
+            disc_diff = discounts.unsqueeze(1) - discounts.unsqueeze(0)
+            delta_ndcg = (gain_diff * disc_diff).abs() * pair_mask
+
+            # Logistic pairwise loss weighted by ΔNDCG
+            pair_loss = torch.log1p(torch.exp(
+                -self.sigma * pred_diff * true_diff.sign()
+            ))
+
+            query_loss = (delta_ndcg * pair_loss * pair_mask).sum()
+            num_pairs = pair_mask.sum().clamp(min=1)
+            total_loss = total_loss + query_loss / num_pairs
+
+        return total_loss / max(batch_size, 1)
 
 def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
     """计算新的评估指标：Top 5 收益之和，以及与理论最高值和随机值的比值"""
@@ -577,21 +575,30 @@ def main():
     # 2. 特征工程与预处理
     train_data, features = preprocess_data(train_df, is_train=True, stockid2idx=stockid2idx)
     val_data, _ = preprocess_val_data(val_df, stockid2idx=stockid2idx)
-    
-    # 3. 标准化
-    scaler = StandardScaler()
 
+    # 清理 inf/nan
     train_data[features] = train_data[features].replace([np.inf, -np.inf], np.nan)
     val_data[features] = val_data[features].replace([np.inf, -np.inf], np.nan)
-    # 丢弃nan数据
     train_data = train_data.dropna(subset=features)
     val_data = val_data.dropna(subset=features)
-    # 然后再缩放
+
+    # 2.5 特征筛选 (LightGBM LambdaRank，在scaler之前)
+    topk = config.get('feature_selection_topk', 80)
+    if topk > 0 and topk < len(features):
+        lgb_features = [f for f in features if f != 'instrument']
+        selected_features = select_features_lgb(train_data, lgb_features, topk=topk)
+        selected_features = ['instrument'] + selected_features
+        features = selected_features
+        with open(os.path.join(output_dir, 'selected_features.json'), 'w') as f:
+            json.dump(features, f, ensure_ascii=False)
+        print(f"特征筛选完成，使用 {len(features)} 个特征")
+
+    # 3. 标准化
+    scaler = StandardScaler()
     train_data[features] = scaler.fit_transform(train_data[features])
     val_data[features] = scaler.transform(val_data[features])
     joblib.dump(scaler, os.path.join(output_dir, 'scaler.pkl'))
 
-    
     # 4. 创建排序数据集
     train_sequences, train_targets, train_relevance, train_stock_indices = create_ranking_dataset_vectorized(
         train_data,
@@ -638,16 +645,28 @@ def main():
     print(f"模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     
     # 7. 损失函数和优化器
-    criterion = WeightedRankingLoss(
-        k=5,
-        temperature=1.0,
-        weight_factor=config['top5_weight'],
-        pairwise_weight=config['pairwise_weight'],
-        base_weight=config.get('base_weight', 1.0)
-    )  # 使用加权排序损失
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.2, total_iters=config['num_epochs'])
-    
+    criterion = LambdaRankLoss(
+        sigma=config.get('lambda_sigma', 1.0),
+        k=5
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'], weight_decay=1e-4)
+
+    # Warmup + Cosine Annealing 学习率调度
+    warmup_epochs = config.get('warmup_epochs', 5)
+    total_epochs = config['num_epochs']
+    peak_lr = config['learning_rate']
+    min_lr = config.get('min_learning_rate', 1e-6)
+
+    def get_lr(epoch):
+        if epoch < warmup_epochs:
+            # Linear warmup
+            return min_lr + (peak_lr - min_lr) * epoch / max(warmup_epochs, 1)
+        else:
+            # Cosine annealing
+            progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+            return min_lr + (peak_lr - min_lr) * (1 + math.cos(math.pi * progress)) / 2
+
+
     # 8. 排序模型训练
     if is_train:
         best_score = -float('inf')
@@ -674,10 +693,12 @@ def main():
             for k, v in eval_metrics.items():
                 print(f"Eval {k}: {v:.4f}")
             
-            # 学习率调度
-            scheduler.step()
+            # 学习率调度 (Warmup + Cosine)
+            current_lr = get_lr(epoch)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
             if writer:
-                writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step=epoch)
+                writer.add_scalar('train/learning_rate', current_lr, global_step=epoch)
             
 
             # 保存最佳模型（基于final score）

@@ -22,18 +22,32 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1)]
         return self.dropout(x)
 class CrossStockAttention(nn.Module):
-    """股票间交互注意力模块"""
+    """股票间交互注意力模块（含门控机制）"""
     def __init__(self, d_model, nhead, dropout=0.1):
         super(CrossStockAttention, self).__init__()
         self.cross_attention = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        
+
+        # 门控机制：学习"何时参考其他股票"
+        self.gate = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.Sigmoid()
+        )
+
     def forward(self, stock_features):
         # stock_features: [batch, num_stocks, d_model]
-        # 股票间交互：每只股票都关注其他股票的特征
         attended, _ = self.cross_attention(stock_features, stock_features, stock_features)
-        output = self.norm(stock_features + self.dropout(attended))
+        attn_out = self.norm1(stock_features + self.dropout(attended))
+
+        # 门控: 对每只股票，决定多少信息来自自身 vs 来自其他股票
+        pooled = stock_features.mean(dim=1, keepdim=True)  # [B, 1, d_model]
+        pooled = pooled.expand(-1, stock_features.size(1), -1)  # [B, N, d_model]
+        gate_input = torch.cat([attn_out, pooled], dim=-1)  # [B, N, 2*d_model]
+        gate_val = self.gate(gate_input)  # [B, N, d_model]
+
+        output = self.norm2(gate_val * attn_out + (1 - gate_val) * stock_features)
         return output
 
 class FeatureAttention(nn.Module):
@@ -60,11 +74,11 @@ class StockTransformer(nn.Module):
         self.model_type = 'RankingTransformer'
         self.config = config
         self.num_stocks = num_stocks
-        
+
         # 输入投影层
         self.input_proj = nn.Linear(input_dim, config['d_model'])
         self.pos_encoder = PositionalEncoding(config['d_model'], config['dropout'], config['sequence_length'])
-        
+
         # 时序特征提取
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config['d_model'],
@@ -74,13 +88,18 @@ class StockTransformer(nn.Module):
             batch_first=True
         )
         self.temporal_encoder = nn.TransformerEncoder(encoder_layer, num_layers=config['num_layers'])
-        
+
         # 特征注意力
         self.feature_attention = FeatureAttention(config['d_model'], config['dropout'])
-        
+
+        # 可学习股票 Embedding
+        emb_dim = config.get('stock_embedding_dim', 32)
+        self.stock_embedding = nn.Embedding(num_stocks, emb_dim)
+        self.stock_emb_proj = nn.Linear(emb_dim, config['d_model'])
+
         # 股票间交互注意力
         self.cross_stock_attention = CrossStockAttention(config['d_model'], config['nhead'], config['dropout'])
-        
+
         # 排序特异性层
         self.ranking_layers = nn.Sequential(
             nn.Linear(config['d_model'], config['d_model']),
@@ -92,7 +111,7 @@ class StockTransformer(nn.Module):
             nn.ReLU(),
             nn.Dropout(config['dropout'])
         )
-        
+
         # 最终排序分数输出
         self.score_head = nn.Sequential(
             nn.Linear(config['d_model'] // 2, config['d_model'] // 4),
@@ -100,7 +119,7 @@ class StockTransformer(nn.Module):
             nn.Dropout(config['dropout'] * 0.5),
             nn.Linear(config['d_model'] // 4, 1)
         )
-        
+
         # 初始化权重
         self._init_weights()
         
@@ -115,37 +134,43 @@ class StockTransformer(nn.Module):
     def forward(self, src):
         # src: [batch, num_stocks, seq_len, feature_dim]
         batch_size, num_stocks, seq_len, feature_dim = src.size()
-        
+
         # 重塑为 [batch*num_stocks, seq_len, feature_dim]
         src_reshaped = src.view(batch_size * num_stocks, seq_len, feature_dim)
-        
+
         # 输入投影和位置编码
         src_proj = self.input_proj(src_reshaped)  # [batch*num_stocks, seq_len, d_model]
         src_proj = self.pos_encoder(src_proj)
-        
+
         # 时序特征提取
         temporal_features = self.temporal_encoder(src_proj)  # [batch*num_stocks, seq_len, d_model]
-        
+
         # 特征注意力聚合
         aggregated_features = self.feature_attention(temporal_features)  # [batch*num_stocks, d_model]
-        
-        # 重塑回股票维度用于股票间交互
+
+        # 重塑回股票维度
         stock_features = aggregated_features.view(batch_size, num_stocks, -1)  # [batch, num_stocks, d_model]
-        
+
+        # 注入可学习股票Embedding（additive bias）
+        stock_ids = torch.arange(num_stocks, device=src.device)
+        stock_emb = self.stock_embedding(stock_ids)  # [num_stocks, emb_dim]
+        stock_emb = self.stock_emb_proj(stock_emb).unsqueeze(0)  # [1, num_stocks, d_model]
+        stock_features = stock_features + stock_emb
+
         # 股票间交互注意力
         interactive_features = self.cross_stock_attention(stock_features)  # [batch, num_stocks, d_model]
-        
+
         # 重塑回原形状
         interactive_features = interactive_features.view(batch_size * num_stocks, -1)
-        
+
         # 排序特异性变换
         ranking_features = self.ranking_layers(interactive_features)  # [batch*num_stocks, d_model//2]
-        
+
         # 生成排序分数
         scores = self.score_head(ranking_features)  # [batch*num_stocks, 1]
-        
+
         # 重塑为最终输出格式
         output = scores.view(batch_size, num_stocks)  # [batch, num_stocks]
-        
+
         return output
 

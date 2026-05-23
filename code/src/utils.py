@@ -637,3 +637,60 @@ def create_ranking_dataset_vectorized(data, features, sequence_length, ranking_d
     #     print(f"数据集已保存到: {ranking_data_path}")
 
     return sequences, targets, relevance_scores, stock_indices
+
+
+def select_features_lgb(data, feature_cols, label_col='label', topk=80, seed=42):
+    """
+    使用 LightGBM LambdaRank 评估特征重要性，返回 top-k 特征名列表。
+    data: 包含特征列和 label 列的 DataFrame
+    feature_cols: 候选特征列名列表 (不含 'instrument' 等ID列)
+    """
+    import numpy as np
+    import lightgbm as lgb
+
+    data = data.copy()
+    data['日期'] = pd.to_datetime(data['日期'])
+    data = data.sort_values(['日期', 'instrument']).reset_index(drop=True)
+
+    # 每只股票至少需要一定数据量
+    valid_mask = data.groupby('instrument')['label'].transform('count') >= 5
+    data = data[valid_mask]
+
+    # 构建 query groups (按日)
+    grouped = data.groupby('日期')
+    query_sizes = grouped.size().values
+    query_sizes = query_sizes[query_sizes >= 10]  # 过滤太小的组
+
+    # 重新按有效组过滤数据
+    valid_dates = grouped.filter(lambda g: len(g) >= 10)
+    query_sizes = valid_dates.groupby('日期').size().values
+
+    X = valid_dates[feature_cols].values.astype(np.float64)
+    y_raw = valid_dates[label_col].values.astype(np.float64)
+
+    # LambdaRank 要求小范围整数 label，按分位数离散化为 0~4
+    y_rank = y_raw.argsort().argsort().astype(np.float64) / max(len(y_raw) - 1, 1)
+    y = np.floor(y_rank * 5).clip(0, 4).astype(np.int32)
+
+    print(f"LightGBM 特征筛选: {len(feature_cols)} 个特征, {len(X)} 条样本, {len(query_sizes)} 个 query")
+
+    model = lgb.LGBMRanker(
+        objective='lambdarank',
+        metric='ndcg',
+        num_leaves=63,
+        max_depth=6,
+        n_estimators=100,
+        learning_rate=0.05,
+        subsample=0.8,
+        random_state=seed,
+        verbose=-1,
+    )
+    model.fit(X, y, group=query_sizes)
+
+    importance = model.feature_importances_
+    top_indices = np.argsort(importance)[::-1][:topk]
+    selected = [feature_cols[i] for i in top_indices]
+
+    print(f"保留 Top-{topk} 特征, 前10: {selected[:10]}")
+
+    return selected

@@ -1,0 +1,27 @@
+{
+    "sequence_length": 60,
+    "d_model": 320,
+    "nhead": 8,
+    "num_layers": 4,
+    "dim_feedforward": 640,
+    "batch_size": 4,
+    "num_epochs": 60,
+    "learning_rate": 0.0001,
+    "min_learning_rate": 1e-06,
+    "warmup_epochs": 5,
+    "dropout": 0.1,
+    "feature_num": "158+39",
+    "max_grad_norm": 5.0,
+    "stock_embedding_dim": 32,
+    "pairwise_weight": 2.0,
+    "base_weight": 1.0,
+    "top5_weight": 3.0,
+    "label_horizon_weights": [
+        0.3,
+        0.7
+    ],
+    "lambda_sigma": 1.0,
+    "feature_selection_topk": 80,
+    "output_dir": "./model/60_158+39_v2",
+    "data_path": "./data"
+}
