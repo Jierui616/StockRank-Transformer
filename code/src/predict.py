@@ -97,12 +97,9 @@ def build_inference_sequences(data, features, sequence_length, stock_ids, latest
 
 def main():
 	data_file = os.path.join(config['data_path'], 'train.csv')
-	model_path = os.path.join(config['output_dir'], 'best_model.pth')
 	scaler_path = os.path.join(config['output_dir'], 'scaler.pkl')
 	output_path = os.path.join('./output/', 'result.csv')
 
-	if not os.path.exists(model_path):
-		raise FileNotFoundError(f'未找到模型文件: {model_path}')
 	if not os.path.exists(scaler_path):
 		raise FileNotFoundError(f'未找到Scaler文件: {scaler_path}')
 
@@ -144,6 +141,10 @@ def main():
 	else:
 		device = torch.device('cpu')
 
+	model_path = os.path.join(config['output_dir'], 'best_model.pth')
+	if not os.path.exists(model_path):
+		raise FileNotFoundError(f'未找到模型文件: {model_path}')
+
 	model = StockTransformer(input_dim=len(features), config=config, num_stocks=len(stock_ids))
 	model.load_state_dict(torch.load(model_path, map_location=device))
 	model.to(device)
@@ -156,13 +157,34 @@ def main():
 	order = np.argsort(scores)[::-1]
 	ranked_stock_ids = [sequence_stock_ids[i] for i in order]
 
-	# Top5 按 softmax(scores) 分配权重
 	if len(ranked_stock_ids) < 5:
 		raise ValueError(f'可预测股票不足5只，当前仅有 {len(ranked_stock_ids)} 只')
+
+	# Top5 权重分配策略 (A/B test: score_linear > top1_only > rank_linear > softmax)
 	top5_stocks = ranked_stock_ids[:5]
 	top5_scores = scores[order][:5]
-	top5_weights = softmax(top5_scores)
-	top5_weights[-1] = 1.0 - top5_weights[:-1].sum()  # 强制和精确为1.0
+	weight_mode = config.get('inference_weight_mode', 'score_linear')
+	temperature = config.get('inference_temperature', 1.0)
+
+	if weight_mode == 'equal':
+		top5_weights = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
+	elif weight_mode == 'rank_linear':
+		top5_weights = np.array([5/15, 4/15, 3/15, 2/15, 1/15])
+	elif weight_mode == 'score_linear':
+		s_min = top5_scores.min()
+		s_range = top5_scores.max() - s_min
+		if s_range > 1e-8:
+			top5_weights = (top5_scores - s_min) / s_range
+		else:
+			top5_weights = np.ones(5)
+		top5_weights = top5_weights.astype(np.float64)
+		top5_weights = top5_weights / top5_weights.sum()
+		top5_weights = np.clip(top5_weights, 0, 1)
+	else:  # softmax
+		top5_scores_f64 = top5_scores.astype(np.float64)
+		top5_weights = softmax(top5_scores_f64 / max(temperature, 1e-8))
+		top5_weights = top5_weights / top5_weights.sum()
+
 	output_df = pd.DataFrame({
 		'stock_id': top5_stocks,
 		'weight': top5_weights,
@@ -171,6 +193,9 @@ def main():
 
 	print(f'预测日期: {latest_date.date()}')
 	print(f'参与排序股票数: {len(ranked_stock_ids)}')
+	if temperature != 1.0:
+		print(f'Temperature: {temperature}')
+	print(f'Top-5: {dict(zip(top5_stocks, top5_weights))}')
 	print(f'结果已写入: {output_path}')
 
 

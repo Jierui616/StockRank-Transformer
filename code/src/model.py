@@ -50,6 +50,48 @@ class CrossStockAttention(nn.Module):
         output = self.norm2(gate_val * attn_out + (1 - gate_val) * stock_features)
         return output
 
+class MarketEncoder(nn.Module):
+    """市场状态编码器：池化全市场股票特征，生成市场上下文向量，
+    通过 FiLM 门控注入回每只股票，使模型感知牛熊/震荡等宏观状态。"""
+    def __init__(self, d_model, dropout=0.1):
+        super(MarketEncoder, self).__init__()
+        self.d_model = d_model
+        # 市场统计：均值 + 标准差 → 2*d_model
+        self.market_proj = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        # FiLM: gamma（缩放）和 beta（偏移）
+        self.film_generator = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.Tanh(),  # gamma 在 [-1, 1] 范围，避免放大噪声
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, stock_features):
+        # stock_features: [B, N, d_model]
+        B, N, D = stock_features.shape
+        # 跨股票池化
+        market_mean = stock_features.mean(dim=1)  # [B, D]
+        market_std = stock_features.std(dim=1, unbiased=False)  # [B, D]
+        market_pooled = torch.cat([market_mean, market_std], dim=-1)  # [B, 2D]
+
+        # 编码市场状态
+        market_ctx = self.market_proj(market_pooled)  # [B, D]
+
+        # 生成 FiLM 参数
+        film = self.film_generator(market_ctx)  # [B, 2D]
+        gamma, beta = film.chunk(2, dim=-1)  # each [B, D]
+        gamma = gamma.unsqueeze(1)  # [B, 1, D]
+        beta = beta.unsqueeze(1)    # [B, 1, D]
+
+        # FiLM 调制
+        modulated = gamma * stock_features + beta  # [B, N, D]
+        return self.norm(modulated)
+
 class FeatureAttention(nn.Module):
     """特征注意力模块"""
     def __init__(self, d_model, dropout=0.1):
@@ -96,6 +138,12 @@ class StockTransformer(nn.Module):
         emb_dim = config.get('stock_embedding_dim', 32)
         self.stock_embedding = nn.Embedding(num_stocks, emb_dim)
         self.stock_emb_proj = nn.Linear(emb_dim, config['d_model'])
+
+        # 市场状态编码器（可选）
+        self.use_market_encoder = config.get('use_market_encoder', False)
+        if self.use_market_encoder:
+            self.market_encoder = MarketEncoder(config['d_model'], config['dropout'])
+            print(f"已启用 Market Encoder (FiLM 门控)")
 
         # 股票间交互注意力
         self.cross_stock_attention = CrossStockAttention(config['d_model'], config['nhead'], config['dropout'])
@@ -156,6 +204,10 @@ class StockTransformer(nn.Module):
         stock_emb = self.stock_embedding(stock_ids)  # [num_stocks, emb_dim]
         stock_emb = self.stock_emb_proj(stock_emb).unsqueeze(0)  # [1, num_stocks, d_model]
         stock_features = stock_features + stock_emb
+
+        # 市场编码器：感知牛熊/震荡等宏观状态
+        if self.use_market_encoder:
+            stock_features = self.market_encoder(stock_features)
 
         # 股票间交互注意力
         interactive_features = self.cross_stock_attention(stock_features)  # [batch, num_stocks, d_model]

@@ -1,1 +1,3 @@
-Best epoch: 33\nBest final_score: 0.257853\n
+Seed: 42
+Best epoch: 2
+Best final_score: -0.022628

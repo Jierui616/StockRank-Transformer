@@ -1,18 +1,19 @@
 {
     "sequence_length": 60,
-    "d_model": 320,
+    "d_model": 128,
     "nhead": 8,
-    "num_layers": 4,
-    "dim_feedforward": 640,
+    "num_layers": 2,
+    "dim_feedforward": 256,
     "batch_size": 4,
     "num_epochs": 60,
     "learning_rate": 0.0001,
     "min_learning_rate": 1e-06,
     "warmup_epochs": 5,
-    "dropout": 0.1,
+    "dropout": 0.15,
     "feature_num": "158+39",
     "max_grad_norm": 5.0,
     "stock_embedding_dim": 32,
+    "use_market_encoder": false,
     "pairwise_weight": 2.0,
     "base_weight": 1.0,
     "top5_weight": 3.0,
@@ -22,6 +23,7 @@
     ],
     "use_label_neutralization": false,
     "lambda_sigma": 0.5,
+    "loss_type": "approx_ndcg",
     "sigma_search": [
         0.3,
         0.5,
@@ -29,7 +31,25 @@
         2.0,
         5.0
     ],
+    "run_sigma_grid_search": false,
     "feature_selection_topk": 80,
+    "run_topk_grid_search": false,
+    "topk_search": [
+        80
+    ],
+    "max_preprocess_workers": 4,
+    "early_stopping_patience": 10,
+    "lr_scheduler": "plateau",
+    "lr_patience": 5,
+    "lr_factor": 0.5,
+    "gradient_accumulation_steps": 4,
+    "ensemble": false,
+    "seeds": [
+        42
+    ],
+    "base_seed": 42,
+    "inference_temperature": 1.0,
+    "inference_weight_mode": "rank_linear",
     "output_dir": "./model/60_158+39_v2",
     "data_path": "./data"
 }
