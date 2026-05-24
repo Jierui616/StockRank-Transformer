@@ -1,18 +1,18 @@
 # 配置参数
-sequence_length = 60
+sequence_length = 20
 feature_num = '158+39'
 config = {
-    'sequence_length': sequence_length,   # 使用过去40个交易日的数据 (60→40，增加样本量)
-    'd_model': 128,          # Transformer输入维度 (320→128，减轻过拟合)
+    'sequence_length': sequence_length,   # v4最佳: 20
+    'd_model': 64,          # 128→64，减小模型容量
     'nhead': 8,             # 注意力头数量
-    'num_layers': 2,        # Transformer层数 (4→2)
-    'dim_feedforward': 256, # 前馈网络维度 (640→256)
+    'num_layers': 2,        # Transformer层数
+    'dim_feedforward': 128, # 256→128，配合d_model缩减
     'batch_size': 4,        # 排序任务batch_size
     'num_epochs': 60,       # 最大epoch数 (早停会提前终止)
     'learning_rate': 1e-4,  # 峰值学习率
     'min_learning_rate': 1e-6,  # 最小学习率
     'warmup_epochs': 5,     # Warmup epoch数
-    'dropout': 0.15,        # Dropout
+    'dropout': 0.30,        # v4最佳: 0.30
     'feature_num': feature_num,
     'max_grad_norm': 5.0,
     'stock_embedding_dim': 32,  # 可学习股票Embedding维度
@@ -30,7 +30,10 @@ config = {
 
     # LambdaRank / ApproxNDCG 参数
     'lambda_sigma': 0.5,     # sigmoid 温度 (0.3~5.0)
-    'loss_type': 'approx_ndcg',  # 'approx_ndcg' 或 'lambdarank'
+    'loss_type': 'listmle_pairwise',  # ListMLE + PairwiseTopK 混合损失
+    'listmle_k': 10,         # ListMLE 的 k 参数
+    'pairwise_margin': 0.1,  # top-5 vs rest 的最小分数差距
+    'pairwise_loss_weight': 0.5,  # pairwise 损失权重
     'sigma_search': [0.3, 0.5, 1.0, 2.0, 5.0],  # 网格搜索候选值
     'run_sigma_grid_search': False,  # sigma 网格搜索已完成，最佳 sigma=0.5
 
@@ -44,22 +47,29 @@ config = {
     'early_stopping_patience': 10,
 
     # 学习率调度
-    'lr_scheduler': 'plateau',  # 'plateau' 或 'cosine'
+    'lr_scheduler': 'plateau',  # 'plateau' | 'cosine' | 'cyclic_cosine'
     'lr_patience': 5,           # plateau 模式: 5轮不提升则降lr
     'lr_factor': 0.5,           # plateau 模式: lr 衰减因子
+
+    # Snapshot ensemble 相关 (当前未启用，保留备用)
+    'cyclic_period': 8,
+    'cyclic_cycles': 5,
+    'snapshot_val_threshold': 0.05,
+    'snapshot_min_count': 2,
 
     # 梯度累积 (有效 batch_size = batch_size × accumulation_steps)
     'gradient_accumulation_steps': 4,
 
-    # 集成训练 (单 seed 模式)
-    'ensemble': False,
-    'seeds': [42],
+    # 集成训练 (多 seed 筛选，Plateau 早停保证质量)
+    'ensemble': True,
+    'seeds': [42, 123, 456, 789, 1024, 2024, 555, 777, 888, 999],
     'base_seed': 42,
 
     # 推理
     'inference_temperature': 1.0,
-    'inference_weight_mode': 'rank_linear',  # rank_linear best for 75-sample model
+    'inference_weight_mode': 'equal',  # equal: 模型top-5内部排序不可靠，等权更鲁棒 (seed456: 0.0875)
+    'ensemble_mode': 'mean',  # 融合模式: 'mean' 均值分数 / 'rank' 均值排名 / 'median' 中位数 (多模型融合已证实无效，保留单模型)
 
-    'output_dir': f'./model/{sequence_length}_{feature_num}_v2',
+    'output_dir': f'./model/{sequence_length}_{feature_num}_v10',
     'data_path': './data',
 }

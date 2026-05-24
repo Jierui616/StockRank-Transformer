@@ -204,7 +204,8 @@ def engineer_features(df):
         feature_names.append(f'BETA{w}')
         
         # R-squared can be calculated as CORREL^2
-        time_period_series = pd.Series(range(w), index=close.index[:w])
+        avail = min(w, len(close))
+        time_period_series = pd.Series(range(avail), index=close.index[:avail])
         rolling_corr = close.rolling(w).corr(time_period_series)
         rsquare = rolling_corr**2
         features.append(rsquare)
@@ -694,3 +695,53 @@ def select_features_lgb(data, feature_cols, label_col='label', topk=80, seed=42)
     print(f"保留 Top-{topk} 特征, 前10: {selected[:10]}")
 
     return selected
+
+
+# 截面特征: 在每个交易日计算所有股票的排名分位数和z-score
+CS_FEATURES = [
+    # 基础行情 (量价直接可比)
+    '涨跌幅', '换手率', '成交量', '成交额', '振幅',
+    # 收益类 (不同时间尺度动量)
+    'return_1', 'return_5', 'return_10',
+    # 波动类 (风险度量)
+    'volatility_10', 'volatility_20', 'atr_14',
+    # 均线类 (趋势位置)
+    'sma_5', 'sma_20', 'ema_12', 'ema_26', 'ema_60',
+    # 技术指标
+    'rsi', 'macd', 'macd_signal',
+    'kdj_k', 'kdj_d', 'kdj_j',
+    # 布林带
+    'boll_mid', 'boll_std',
+    # 成交量指标
+    'volume_ratio', 'volume_change', 'volume_ma_5', 'volume_ma_20',
+    # 价差类 (日内形态)
+    'high_low_spread', 'open_close_spread',
+    # Alpha精选 (标准化后的相对指标)
+    'ROC5', 'ROC10', 'ROC20',
+    'RSV10', 'RSV20',
+    'RANK10', 'RANK20',
+    'CORR10', 'CORR20',
+    'STD10', 'STD20',
+    'BETA10', 'BETA20',
+]
+
+
+def add_cross_sectional_features(df, feature_columns):
+    """
+    为关键特征添加截面排名分位数和z-score。
+    截面特征直接编码一只股票当天在所有股票中的相对位置。
+    """
+    df = df.copy()
+    cs_cols = [c for c in CS_FEATURES if c in df.columns]
+    new_features = []
+
+    for col in cs_cols:
+        rank_col = f'{col}_cs_rank'
+        z_col = f'{col}_cs_z'
+        df[rank_col] = df.groupby('日期')[col].rank(pct=True)
+        g = df.groupby('日期')[col]
+        df[z_col] = (df[col] - g.transform('mean')) / (g.transform('std') + 1e-8)
+        new_features.extend([rank_col, z_col])
+
+    print(f"添加 {len(cs_cols)} 个截面特征 -> {len(new_features)} 个新列")
+    return df, new_features

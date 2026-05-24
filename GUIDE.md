@@ -31,7 +31,20 @@ end_date = "***"
 ```
 建议先将现有数据删除后，再运行`python get_stock_data.py`，即可下载所需时间段的数据，默认保存为data/stock_data.csv
 
-（如果出现网络问题，请关闭代理重试，多尝试几次）
+**baostock 版本问题**：如果出现 `登录失败: 网络接收错误` 或 `WinError 10057`，是因为旧版 baostock（0.9.1）连接的服务器已下线。
+新版 (>= 00.9.10) 使用 `public-api.baostock.com:10030`。升级方法：
+
+```powershell
+# 先确认当前环境的 baostock 版本和服务器地址
+python -c "import baostock, os; f=open(os.path.join(os.path.dirname(baostock.__file__),'common','contants.py'),encoding='utf-8'); [print(l.strip()) for l in f if 'SERVER_IP' in l]"
+# 如果输出是 www.baostock.com 即为旧版，执行升级：
+uv pip install --upgrade baostock
+# 或
+.venv\Scripts\python.exe -m pip install --upgrade --force-reinstall baostock
+```
+
+升级后再次运行上面的检查命令，确认输出变为 `BAOSTOCK_SERVER_IP = "public-api.baostock.com"` 即可。
+（如果仍有网络问题，请关闭代理重试）
 
 成功下载数据
 

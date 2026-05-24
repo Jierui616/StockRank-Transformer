@@ -116,7 +116,13 @@ def _preprocess_common(df, stockid2idx, desc, drop_small_open=True):
     processed['instrument'] = processed['instrument'].astype(np.int64)
 
     processed = _build_label_and_clean(processed, drop_small_open=drop_small_open)
-    return processed, feature_columns
+
+    # 添加截面特征
+    from utils import add_cross_sectional_features
+    processed, cs_features = add_cross_sectional_features(processed, feature_columns)
+    all_features = feature_columns + cs_features
+
+    return processed, all_features
 
 
 # 数据预处理函数
@@ -227,6 +233,87 @@ class LambdaRankLoss(nn.Module):
         loss = (query_loss / num_pairs).mean()
 
         return loss
+
+class ListMLELoss(nn.Module):
+    """
+    ListMLE (List-wise Maximum Likelihood Estimation) via Plackett-Luce model.
+    L = -Σ_{i=1}^{k} log P(item at rank i | remaining items)
+    直接最大化真实排序的似然，不需要 gain function，对小数据更鲁棒。
+    """
+    def __init__(self, k=5):
+        super(ListMLELoss, self).__init__()
+        self.k = k
+
+    def forward(self, y_pred, y_true):
+        B, N = y_pred.size()
+        device = y_pred.device
+        k = N if self.k is None else min(self.k, N)
+
+        # 真实排序: 按 y_true 降序的索引
+        _, true_order = y_true.sort(dim=1, descending=True)  # [B, N]
+
+        loss = torch.tensor(0.0, device=device)
+        for i in range(k):
+            # 第 i 个位置的正确股票索引
+            idx_i = true_order[:, i]                      # [B]
+            s_i = y_pred.gather(1, idx_i.unsqueeze(1)).squeeze(1)  # [B]
+
+            # 剩余候选集: 位置 i 到 N-1
+            remaining_idx = true_order[:, i:]             # [B, N-i]
+            remaining_scores = y_pred.gather(1, remaining_idx)  # [B, N-i]
+
+            # log Σ_{j>=i} exp(s_j) - s_i  (总是 >=0)
+            log_sum_exp = torch.logsumexp(remaining_scores, dim=1)  # [B]
+            loss = loss + (log_sum_exp - s_i).mean()
+
+        return loss / k
+
+
+class PairwiseTopKMarginLoss(nn.Module):
+    """
+    Top-K pairwise margin loss: 强制 top-k 股票的分数高于其余股票至少 margin。
+    只关注 top-k vs rest 的区分度，忽略内部排序。
+    """
+    def __init__(self, k=5, margin=0.1):
+        super(PairwiseTopKMarginLoss, self).__init__()
+        self.k = k
+        self.margin = margin
+
+    def forward(self, y_pred, y_true):
+        B, N = y_pred.size()
+        if N <= self.k:
+            return torch.tensor(0.0, device=y_pred.device, requires_grad=True)
+
+        _, sorted_idx = y_true.sort(dim=1, descending=True)
+        topk_idx = sorted_idx[:, :self.k]
+        rest_idx = sorted_idx[:, self.k:]
+
+        topk_scores = y_pred.gather(1, topk_idx).unsqueeze(2)   # [B, k, 1]
+        rest_scores = y_pred.gather(1, rest_idx).unsqueeze(1)   # [B, 1, N-k]
+
+        # Hinge: max(0, margin - (s_top - s_rest))
+        diff = topk_scores - rest_scores                         # [B, k, N-k]
+        loss = torch.relu(self.margin - diff).mean()
+
+        return loss
+
+
+class ListMLEPairwiseLoss(nn.Module):
+    """
+    ListMLE + PairwiseTopKMargin 混合损失。
+    ListMLE 保证排序似然，pairwise margin 确保 top-k 区分度。
+    """
+    def __init__(self, listmle_k=10, pairwise_k=5, margin=0.1, pairwise_weight=0.5):
+        super(ListMLEPairwiseLoss, self).__init__()
+        self.listmle = ListMLELoss(k=listmle_k)
+        self.pairwise = PairwiseTopKMarginLoss(k=pairwise_k, margin=margin)
+        self.pairwise_weight = pairwise_weight
+
+    def forward(self, y_pred, y_true):
+        loss_lmle = self.listmle(y_pred, y_true)
+        loss_pair = self.pairwise(y_pred, y_true)
+        return loss_lmle + self.pairwise_weight * loss_pair
+
 
 def calculate_ranking_metrics(y_pred, y_true, masks, k=5):
     """计算评估指标，包含与测试对齐的加权收益指标。"""
@@ -707,8 +794,20 @@ def _train_one_seed(seed, output_dir, num_stocks, features, device,
     print(f"模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     sigma = override_sigma if override_sigma is not None else config.get('lambda_sigma', 1.0)
-    loss_type = config.get('loss_type', 'approx_ndcg')
-    if loss_type == 'approx_ndcg':
+    loss_type = config.get('loss_type', 'listmle')
+    listmle_k = config.get('listmle_k', 5)
+    if loss_type == 'listmle':
+        criterion = ListMLELoss(k=listmle_k if listmle_k > 0 else None)
+        k_label = f'top-{listmle_k}' if listmle_k > 0 else 'full-list'
+        print(f"使用 ListMLE 损失 ({k_label} Plackett-Luce)")
+    elif loss_type == 'listmle_pairwise':
+        pw_weight = config.get('pairwise_loss_weight', 0.5)
+        pw_margin = config.get('pairwise_margin', 0.1)
+        criterion = ListMLEPairwiseLoss(
+            listmle_k=listmle_k if listmle_k > 0 else None,
+            pairwise_k=5, margin=pw_margin, pairwise_weight=pw_weight)
+        print(f"使用 ListMLE+Pairwise 混合损失 (k={listmle_k}, margin={pw_margin}, pw_weight={pw_weight})")
+    elif loss_type == 'approx_ndcg':
         criterion = ApproxNDCGLoss(sigma=sigma, k=5)
         print(f"使用 ApproxNDCG 损失 (sigma={sigma})")
     else:
@@ -728,8 +827,18 @@ def _train_one_seed(seed, output_dir, num_stocks, features, device,
     lr_factor = config.get('lr_factor', 0.5)
     scheduler_type = config.get('lr_scheduler', 'plateau')
 
-    # Plateau scheduler (ReduceLROnPlateau on final_score)
-    if scheduler_type == 'plateau':
+    # Cyclic Cosine Annealing (snapshot ensemble)
+    if scheduler_type == 'cyclic_cosine':
+        cyclic_period = config.get('cyclic_period', 8)
+        cyclic_cycles = config.get('cyclic_cycles', 4)
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cyclic_period, eta_min=min_lr)
+        snapshot_dir = os.path.join(output_dir, 'snapshots')
+        os.makedirs(snapshot_dir, exist_ok=True)
+        snapshot_scores = []  # list of (epoch, val_score, path)
+        print(f"学习率调度: Cyclic Cosine (period={cyclic_period}, cycles={cyclic_cycles})")
+        print(f"快照保存目录: {snapshot_dir}")
+    elif scheduler_type == 'plateau':
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='max', factor=lr_factor, patience=lr_patience,
             min_lr=min_lr)
@@ -765,6 +874,18 @@ def _train_one_seed(seed, output_dir, num_stocks, features, device,
             current_lr = min_lr + (peak_lr - min_lr) * (epoch + 1) / max(warmup_epochs, 1)
             for param_group in optimizer.param_groups:
                 param_group['lr'] = current_lr
+        elif scheduler_type == 'cyclic_cosine':
+            # Cyclic cosine: 每个周期内 cosine 退火，周期结束时保存快照并重置 LR
+            cycle_epoch = (epoch - warmup_epochs) % cyclic_period
+            is_cycle_end = (cycle_epoch == cyclic_period - 1)
+            if cycle_epoch == 0:
+                # 新周期开始，重置 optimizer 和 scheduler
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = peak_lr
+                lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=cyclic_period, eta_min=min_lr)
+            lr_scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
         elif scheduler_type == 'plateau':
             current_score = eval_metrics.get('final_score', 0.0)
             lr_scheduler.step(current_score)
@@ -790,13 +911,40 @@ def _train_one_seed(seed, output_dir, num_stocks, features, device,
             epochs_no_improve += 1
             print(f"未提升 ({epochs_no_improve}/{patience})")
 
-        if epochs_no_improve >= patience:
+        # Snapshot 保存 (cyclic_cosine 模式)
+        if scheduler_type == 'cyclic_cosine':
+            cycle_epoch = (epoch - warmup_epochs) % cyclic_period
+            is_cycle_end = (cycle_epoch == cyclic_period - 1) and epoch >= warmup_epochs
+            if is_cycle_end:
+                cycle_idx = (epoch - warmup_epochs) // cyclic_period + 1
+                snap_path = os.path.join(
+                    snapshot_dir,
+                    f'snapshot_cycle{cycle_idx}_epoch{epoch+1}_val{current_score:.4f}.pth')
+                torch.save(model.state_dict(), snap_path)
+                snapshot_scores.append({
+                    'cycle': cycle_idx,
+                    'epoch': epoch + 1,
+                    'val_score': float(current_score),
+                    'path': os.path.basename(snap_path),
+                })
+                print(f"[Snapshot] cycle={cycle_idx}, val_score={current_score:.4f}")
+
+        # 早停: cyclic_cosine 模式跑满，其他模式按 patience 早停
+        if scheduler_type != 'cyclic_cosine' and epochs_no_improve >= patience:
             print(f"早停触发! Seed {seed} 在 epoch {epoch+1} 停止")
             break
 
     print(f"\nSeed {seed} 完成! 最佳 epoch: {best_epoch}, 最佳 final score: {best_score:.4f}")
     with open(os.path.join(output_dir, 'final_score.txt'), 'w') as f:
         f.write(f"Seed: {seed}\nBest epoch: {best_epoch}\nBest final_score: {best_score:.6f}\n")
+
+    # 保存快照明细
+    if scheduler_type == 'cyclic_cosine' and snapshot_scores:
+        manifest_path = os.path.join(snapshot_dir, 'scores.json')
+        with open(manifest_path, 'w') as f:
+            json.dump(snapshot_scores, f, indent=2, ensure_ascii=False)
+        print(f"快照明细已保存: {manifest_path} ({len(snapshot_scores)} 个快照)")
+
     writer.close()
     return best_score
 

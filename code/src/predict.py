@@ -74,7 +74,11 @@ def preprocess_predict_data(df, stockid2idx):
 	processed['instrument'] = processed['instrument'].astype(np.int64)
 	processed['日期'] = pd.to_datetime(processed['日期'])
 
-	return processed, feature_columns
+	from utils import add_cross_sectional_features
+	processed, cs_features = add_cross_sectional_features(processed, feature_columns)
+	all_features = feature_columns + cs_features
+
+	return processed, all_features
 
 
 def build_inference_sequences(data, features, sequence_length, stock_ids, latest_date):
@@ -96,9 +100,15 @@ def build_inference_sequences(data, features, sequence_length, stock_ids, latest
 
 
 def main():
+	import argparse
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--seed', type=str, default=None)
+	parser.add_argument('--output', type=str, default=None)
+	_args = parser.parse_args()
+
 	data_file = os.path.join(config['data_path'], 'train.csv')
 	scaler_path = os.path.join(config['output_dir'], 'scaler.pkl')
-	output_path = os.path.join('./output/', 'result.csv')
+	output_path = _args.output if _args.output else os.path.join('./output/', 'result.csv')
 
 	if not os.path.exists(scaler_path):
 		raise FileNotFoundError(f'未找到Scaler文件: {scaler_path}')
@@ -141,18 +151,103 @@ def main():
 	else:
 		device = torch.device('cpu')
 
-	model_path = os.path.join(config['output_dir'], 'best_model.pth')
-	if not os.path.exists(model_path):
-		raise FileNotFoundError(f'未找到模型文件: {model_path}')
+	# 多模型融合：扫描 seed{N}/ 目录，加载所有模型
+	model_paths = []
+	output_dir = config['output_dir']
 
-	model = StockTransformer(input_dim=len(features), config=config, num_stocks=len(stock_ids))
-	model.load_state_dict(torch.load(model_path, map_location=device))
-	model.to(device)
-	model.eval()
+	# 0. 单 seed 推理 (命令行参数)
+	if _args.seed:
+		seed_dir = os.path.join(output_dir, f'seed{_args.seed}')
+		mp = os.path.join(seed_dir, 'best_model.pth')
+		if os.path.exists(mp):
+			model_paths = [mp]
+			print(f'单模型推理: seed{_args.seed}')
+		else:
+			raise FileNotFoundError(f'未找到模型: {mp}')
 
+	# 1. Snapshot ensemble (Plan C)
+	snapshot_manifest = os.path.join(output_dir, 'snapshots', 'scores.json')
+	snapshot_threshold = config.get('snapshot_val_threshold', 0.05)
+	snapshot_min_count = config.get('snapshot_min_count', 2)
+	if os.path.exists(snapshot_manifest):
+		with open(snapshot_manifest, 'r') as f:
+			snapshot_info = json.load(f)
+		filtered = [s for s in snapshot_info if abs(s['val_score']) < snapshot_threshold]
+		if len(filtered) >= snapshot_min_count:
+			for s in filtered:
+				mp = os.path.join(output_dir, 'snapshots', s['path'])
+				if os.path.exists(mp):
+					model_paths.append(mp)
+			print(f'Snapshot 融合: {len(filtered)}/{len(snapshot_info)} 个快照通过阈值筛选 (|val| < {snapshot_threshold})')
+			for s in filtered:
+				print(f'  cycle={s["cycle"]}, epoch={s["epoch"]}, val_score={s["val_score"]:.4f}')
+		elif len(filtered) == 1:
+			print(f'Snapshot: 仅 {len(filtered)} 个快照通过筛选，使用单个快照')
+			model_paths.append(os.path.join(output_dir, 'snapshots', filtered[0]['path']))
+		else:
+			print(f'Snapshot: {len(filtered)} 个快照通过筛选 (阈值={snapshot_threshold})，回退到最佳模型')
+			mp = os.path.join(output_dir, 'best_model.pth')
+			if os.path.exists(mp):
+				model_paths = [mp]
+
+	# 2. Multi-seed 回退
+	if not model_paths and os.path.isdir(output_dir):
+		for name in sorted(os.listdir(output_dir)):
+			seed_dir = os.path.join(output_dir, name)
+			if name.startswith('seed') and os.path.isdir(seed_dir):
+				mp = os.path.join(seed_dir, 'best_model.pth')
+				if os.path.exists(mp):
+					model_paths.append(mp)
+
+	# 3. 单模型回退
+	if not model_paths:
+		mp = os.path.join(output_dir, 'best_model.pth')
+		if os.path.exists(mp):
+			model_paths = [mp]
+
+	if not model_paths:
+		raise FileNotFoundError(f'未找到任何模型文件')
+
+	print(f'加载 {len(model_paths)} 个模型进行融合')
+	if len(model_paths) > 1:
+		for mp in model_paths:
+			print(f'  {os.path.basename(os.path.dirname(mp))}/{os.path.basename(mp)}')
+
+	# 加载所有模型
+	models = []
+	for mp in model_paths:
+		m = StockTransformer(input_dim=len(features), config=config, num_stocks=len(stock_ids))
+		m.load_state_dict(torch.load(mp, map_location=device))
+		m.to(device)
+		m.eval()
+		models.append(m)
+
+	# 融合推理
+	ensemble_mode = config.get('ensemble_mode', 'mean')
 	with torch.no_grad():
 		x = torch.from_numpy(sequences_np).unsqueeze(0).to(device)  # [1, N, L, F]
-		scores = model(x).squeeze(0).detach().cpu().numpy()         # [N]
+		all_scores = []
+		for m in models:
+			s = m(x).squeeze(0).detach().cpu().numpy()  # [N]
+			all_scores.append(s)
+		all_scores = np.array(all_scores)  # [M, N]
+
+		if len(models) == 1:
+			scores = all_scores[0]
+		elif ensemble_mode == 'rank':
+			# Rank 融合：每个模型内转排名，均值排名 → 排序
+			all_ranks = np.zeros_like(all_scores)
+			for i in range(len(models)):
+				all_ranks[i] = len(sequence_stock_ids) - 1 - np.argsort(np.argsort(all_scores[i]))
+			avg_ranks = np.mean(all_ranks, axis=0)  # 平均排名
+			scores = -avg_ranks  # 排名越小越好 → 取负后越大越好
+			print(f'融合模式: rank (平均排名)')
+		elif ensemble_mode == 'median':
+			scores = np.median(all_scores, axis=0)
+			print(f'融合模式: median (中位数分数)')
+		else:  # 'mean'
+			scores = np.mean(all_scores, axis=0)
+			print(f'融合模式: mean (均值分数)')
 
 	order = np.argsort(scores)[::-1]
 	ranked_stock_ids = [sequence_stock_ids[i] for i in order]
