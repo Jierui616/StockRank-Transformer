@@ -60,16 +60,16 @@ config = {
     # 梯度累积 (有效 batch_size = batch_size × accumulation_steps)
     'gradient_accumulation_steps': 4,
 
-    # 集成训练 (多 seed 筛选，Plateau 早停保证质量)
-    'ensemble': True,
-    'seeds': [42, 123, 456, 789, 1024, 2024, 555, 777, 888, 999],
-    'base_seed': 42,
+    # 训练
+    'ensemble': False,
+    'seeds': [123],
+    'base_seed': 123,
 
     # 推理
     'inference_temperature': 1.0,
     'inference_weight_mode': 'equal',  # equal: 模型top-5内部排序不可靠，等权更鲁棒 (seed456: 0.0875)
     'ensemble_mode': 'mean',  # 融合模式: 'mean' 均值分数 / 'rank' 均值排名 / 'median' 中位数 (多模型融合已证实无效，保留单模型)
 
-    'output_dir': f'./model/{sequence_length}_{feature_num}_v10',
+    'output_dir': './model/final',
     'data_path': './data',
 }
