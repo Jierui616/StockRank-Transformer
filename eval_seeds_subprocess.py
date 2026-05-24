@@ -2,9 +2,15 @@
 import os, sys, json, subprocess, shutil, re
 from pathlib import Path
 
-MODEL_DIR = Path("D:/zhuomian/THU-BDC2026-main/model/60_158+39_v3")
+# 从 config 读取 output_dir
+sys.path.insert(0, str(Path(__file__).parent / "code" / "src"))
+from config import config as _config
+MODEL_DIR = Path(_config['output_dir'])
+print(f"Model dir: {MODEL_DIR}")
 OUTPUT_DIR = Path("D:/zhuomian/THU-BDC2026-main/output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR = Path("D:/zhuomian/THU-BDC2026-main/temp")
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 CWD = "D:/zhuomian/THU-BDC2026-main"
 
 seeds = sorted([d.name[4:] for d in MODEL_DIR.iterdir()

@@ -12,7 +12,7 @@ from config import config
 from model import StockTransformer
 from predict import preprocess_predict_data, build_inference_sequences
 
-MODEL_DIR = Path("D:/zhuomian/THU-BDC2026-main/model/60_158+39_v3")
+MODEL_DIR = Path(config['output_dir'])
 OUTPUT_DIR = Path("D:/zhuomian/THU-BDC2026-main/output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
