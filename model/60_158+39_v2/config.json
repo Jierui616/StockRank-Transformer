@@ -42,14 +42,28 @@
     "lr_scheduler": "plateau",
     "lr_patience": 5,
     "lr_factor": 0.5,
+    "cyclic_period": 8,
+    "cyclic_cycles": 5,
+    "snapshot_val_threshold": 0.05,
+    "snapshot_min_count": 2,
     "gradient_accumulation_steps": 4,
-    "ensemble": false,
+    "ensemble": true,
     "seeds": [
-        42
+        42,
+        123,
+        456,
+        789,
+        1024,
+        2024,
+        555,
+        777,
+        888,
+        999
     ],
     "base_seed": 42,
     "inference_temperature": 1.0,
-    "inference_weight_mode": "rank_linear",
+    "inference_weight_mode": "equal",
+    "ensemble_mode": "mean",
     "output_dir": "./model/60_158+39_v2",
     "data_path": "./data"
 }

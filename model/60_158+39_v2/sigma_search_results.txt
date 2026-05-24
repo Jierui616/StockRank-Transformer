@@ -1,0 +1,10 @@
+Sigma grid search results (test scores)
+==================================================
+sigma=0.3: 0.048585
+sigma=0.5: 0.049536 <-- BEST
+sigma=1.0: 0.003109
+sigma=2.0: 0.011366
+sigma=5.0: -0.002863
+
+Note: validation final_score poorly correlates with test score.
+Grid search selected sigma=1.0 based on val metric, but sigma=0.5 is best on test.

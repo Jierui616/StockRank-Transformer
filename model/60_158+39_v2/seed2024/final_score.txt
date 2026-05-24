@@ -1,0 +1,3 @@
+Seed: 2024
+Best epoch: 21
+Best final_score: 0.101617
