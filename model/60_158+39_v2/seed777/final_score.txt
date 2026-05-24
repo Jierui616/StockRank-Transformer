@@ -1,3 +1,0 @@
-Seed: 777
-Best epoch: 16
-Best final_score: 0.052703
