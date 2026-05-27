@@ -50,23 +50,14 @@
     "snapshot_val_threshold": 0.05,
     "snapshot_min_count": 2,
     "gradient_accumulation_steps": 4,
-    "ensemble": true,
+    "ensemble": false,
     "seeds": [
-        42,
-        123,
-        456,
-        789,
-        1024,
-        2024,
-        555,
-        777,
-        888,
-        999
+        123
     ],
-    "base_seed": 42,
+    "base_seed": 123,
     "inference_temperature": 1.0,
     "inference_weight_mode": "equal",
     "ensemble_mode": "mean",
-    "output_dir": "./model/20_158+39_v10",
+    "output_dir": "./model/final",
     "data_path": "./data"
 }
